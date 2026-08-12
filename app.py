@@ -1,462 +1,967 @@
 import streamlit as st
 import sqlite3
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import pandas as pd
-import math
 import hashlib
-import secrets
+from datetime import date
+import pandas as pd
 
-st.set_page_config(page_title="Attendance Tracker", page_icon="📚", layout="centered")
+# ============================================================
+# APP SETTINGS
+# ============================================================
+
+st.set_page_config(
+    page_title="Attendance Tracker",
+    page_icon="📚",
+    layout="wide"
+)
+
 DB_FILE = "attendance.db"
-DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_db():
+    connection = sqlite3.connect(
+        DB_FILE,
+        check_same_thread=False
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
-def now_india():
-    return datetime.now(ZoneInfo("Asia/Kolkata"))
+def init_database():
+    connection = get_db()
 
-
-def today_india():
-    return now_india().date()
-
-
-def hash_password(password, salt=None):
-    salt = salt or secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
-    return salt.hex() + ":" + digest.hex()
-
-
-def verify_password(password, stored):
-    try:
-        salt_hex, digest_hex = stored.split(":")
-        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 200_000).hex()
-        return secrets.compare_digest(digest, digest_hex)
-    except (ValueError, TypeError):
-        return False
-
-
-def get_connection():
-    con = sqlite3.connect(DB_FILE)
-    con.execute("""
+    connection.execute("""
         CREATE TABLE IF NOT EXISTS students (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             full_name TEXT NOT NULL,
             roll_number TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
+            password_hash TEXT NOT NULL,
+            course TEXT NOT NULL,
+            section TEXT NOT NULL
         )
     """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_name TEXT NOT NULL,
-            roll_number TEXT NOT NULL,
-            attendance_date TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            status TEXT NOT NULL,
-            UNIQUE(student_name, roll_number, attendance_date, subject)
-        )
-    """)
-    con.execute("""
+
+    connection.execute("""
         CREATE TABLE IF NOT EXISTS timetable (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id INTEGER NOT NULL,
-            day_name TEXT NOT NULL,
-            lecture_no INTEGER NOT NULL,
-            lecture_time TEXT NOT NULL,
-            subject_code TEXT NOT NULL,
-            subject_name TEXT NOT NULL,
-            UNIQUE(student_id, day_name, lecture_no)
+            roll_number TEXT NOT NULL,
+            weekday INTEGER NOT NULL,
+            lecture_number INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            UNIQUE(
+                roll_number,
+                weekday,
+                lecture_number
+            )
         )
     """)
-    cols = {r[1] for r in con.execute("PRAGMA table_info(students)").fetchall()}
-    for col in ("course", "division", "academic_year"):
-        if col not in cols:
-            con.execute(f"ALTER TABLE students ADD COLUMN {col} TEXT DEFAULT ''")
-    con.commit()
-    return con
+
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            roll_number TEXT NOT NULL,
+            attendance_date TEXT NOT NULL,
+            lecture_number INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            status TEXT NOT NULL,
+            UNIQUE(
+                roll_number,
+                attendance_date,
+                lecture_number
+            )
+        )
+    """)
+
+    connection.commit()
+    connection.close()
 
 
-def register_student(name, roll, password):
-    con = get_connection()
+init_database()
+
+# ============================================================
+# PASSWORD
+# ============================================================
+
+def hash_password(password):
+    return hashlib.sha256(
+        password.encode("utf-8")
+    ).hexdigest()
+
+
+# ============================================================
+# STUDENT FUNCTIONS
+# ============================================================
+
+def get_student(roll_number):
+
+    connection = get_db()
+
+    student = connection.execute(
+        """
+        SELECT *
+        FROM students
+        WHERE roll_number = ?
+        """,
+        (roll_number,)
+    ).fetchone()
+
+    connection.close()
+
+    return student
+
+
+def create_student(
+    full_name,
+    roll_number,
+    password,
+    course,
+    section
+):
+
+    connection = get_db()
+
     try:
-        con.execute("INSERT INTO students(full_name, roll_number, password_hash, course, division, academic_year) VALUES(?,?,?,?,?,?)", (name, roll, hash_password(password), "", "", ""))
-        con.commit()
-        return True, "Account created successfully."
+
+        connection.execute(
+            """
+            INSERT INTO students
+            (
+                full_name,
+                roll_number,
+                password_hash,
+                course,
+                section
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                full_name.strip(),
+                roll_number.strip(),
+                hash_password(password),
+                course.strip(),
+                section.strip()
+            )
+        )
+
+        connection.commit()
+
+        return True
+
     except sqlite3.IntegrityError:
-        return False, "This roll number is already registered."
+
+        return False
+
     finally:
-        con.close()
+
+        connection.close()
 
 
-def login_student(roll, password):
-    con = get_connection()
-    row = con.execute("SELECT id, full_name, roll_number, password_hash, COALESCE(course,''), COALESCE(division,''), COALESCE(academic_year,'') FROM students WHERE roll_number=?", (roll,)).fetchone()
-    con.close()
-    if not row or not verify_password(password, row[3]):
-        return None
-    return {"id": row[0], "full_name": row[1], "roll_number": row[2], "course": row[4], "division": row[5], "academic_year": row[6]}
+# ============================================================
+# TIMETABLE
+# ============================================================
+
+def save_timetable(roll_number, timetable):
+
+    connection = get_db()
+
+    connection.execute(
+        """
+        DELETE FROM timetable
+        WHERE roll_number = ?
+        """,
+        (roll_number,)
+    )
+
+    for item in timetable:
+
+        if item["subject"].strip():
+
+            connection.execute(
+                """
+                INSERT INTO timetable
+                (
+                    roll_number,
+                    weekday,
+                    lecture_number,
+                    subject
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    roll_number,
+                    item["weekday"],
+                    item["lecture_number"],
+                    item["subject"].strip()
+                )
+            )
+
+    connection.commit()
+    connection.close()
 
 
-def update_profile(student_id, course, division, year):
-    con = get_connection()
-    con.execute("UPDATE students SET course=?, division=?, academic_year=? WHERE id=?", (course, division, year, student_id))
-    con.commit()
-    con.close()
+def get_timetable(roll_number):
+
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT
+            weekday,
+            lecture_number,
+            subject
+        FROM timetable
+        WHERE roll_number = ?
+        ORDER BY weekday, lecture_number
+        """,
+        (roll_number,)
+    ).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
 
 
-def load_timetable(student_id):
-    con = get_connection()
-    rows = con.execute("SELECT day_name, lecture_no, lecture_time, subject_code, subject_name FROM timetable WHERE student_id=? ORDER BY CASE day_name WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 WHEN 'Sunday' THEN 7 END, lecture_no", (student_id,)).fetchall()
-    con.close()
-    result = {d: [] for d in DAYS}
-    for row in rows:
-        result[row[0]].append(row[1:])
-    return result
+def get_classes_for_date(
+    roll_number,
+    selected_date
+):
+
+    weekday = selected_date.weekday()
+
+    timetable = get_timetable(roll_number)
+
+    return [
+        item
+        for item in timetable
+        if item["weekday"] == weekday
+    ]
 
 
-def save_timetable(student_id, rows):
-    con = get_connection()
-    try:
-        con.execute("DELETE FROM timetable WHERE student_id=?", (student_id,))
-        for r in rows:
-            con.execute("INSERT INTO timetable(student_id,day_name,lecture_no,lecture_time,subject_code,subject_name) VALUES(?,?,?,?,?,?)", (student_id, r["day_name"], r["lecture_no"], r["lecture_time"], r["subject_code"], r["subject_name"]))
-        con.commit()
-        return True, "Timetable saved successfully."
-    except sqlite3.Error as e:
-        con.rollback()
-        return False, f"Could not save timetable: {e}"
-    finally:
-        con.close()
+# ============================================================
+# ATTENDANCE
+# ============================================================
+
+def save_attendance(
+    roll_number,
+    selected_date,
+    records
+):
+
+    # NEVER allow future dates
+    if selected_date > date.today():
+
+        return False
+
+    connection = get_db()
+
+    for record in records:
+
+        connection.execute(
+            """
+            INSERT INTO attendance
+            (
+                roll_number,
+                attendance_date,
+                lecture_number,
+                subject,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(
+                roll_number,
+                attendance_date,
+                lecture_number
+            )
+
+            DO UPDATE SET
+                subject = excluded.subject,
+                status = excluded.status
+            """,
+            (
+                roll_number,
+                selected_date.isoformat(),
+                record["lecture_number"],
+                record["subject"],
+                record["status"]
+            )
+        )
+
+    connection.commit()
+    connection.close()
+
+    return True
 
 
-def save_attendance(name, roll, selected_date, data):
-    if selected_date > today_india():
-        return False, "Future dates cannot be saved."
-    con = get_connection()
-    try:
-        for subject, status in data.items():
-            con.execute("""
-                INSERT INTO attendance(student_name,roll_number,attendance_date,subject,status)
-                VALUES(?,?,?,?,?)
-                ON CONFLICT(student_name,roll_number,attendance_date,subject)
-                DO UPDATE SET status=excluded.status
-            """, (name, roll, selected_date.isoformat(), subject, status))
-        con.commit()
-        return True, "Attendance saved successfully."
-    except sqlite3.Error as e:
-        con.rollback()
-        return False, f"Could not save attendance: {e}"
-    finally:
-        con.close()
+def get_attendance(roll_number):
+
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT
+            attendance_date,
+            lecture_number,
+            subject,
+            status
+        FROM attendance
+        WHERE roll_number = ?
+        ORDER BY
+            attendance_date DESC,
+            lecture_number
+        """,
+        (roll_number,)
+    ).fetchall()
+
+    connection.close()
+
+    return pd.DataFrame(
+        [dict(row) for row in rows]
+    )
 
 
-def load_attendance(name, roll):
-    con = get_connection()
-    df = pd.read_sql_query("SELECT attendance_date, subject, status FROM attendance WHERE student_name=? AND roll_number=? ORDER BY attendance_date DESC", con, params=(name, roll))
-    con.close()
-    return df
+# ============================================================
+# REPORT
+# ============================================================
 
+def make_report(data):
 
-def needed_for_75(present, total):
-    if total <= 0 or present / total >= 0.75:
-        return 0
-    return max(0, math.ceil((0.75 * total - present) / 0.25))
+    if data.empty:
 
+        return pd.DataFrame()
 
-def can_miss_at_75(present, total):
-    if total <= 0 or present / total < 0.75:
-        return 0
-    return max(0, math.floor(present / 0.75 - total))
+    subjects = sorted(
+        data["subject"].unique()
+    )
 
+    report = []
 
-def read_timetable(upload):
-    try:
-        if upload.name.lower().endswith(".csv"):
-            df = pd.read_csv(upload)
+    for subject in subjects:
+
+        subject_data = data[
+            data["subject"] == subject
+        ]
+
+        present = int(
+            (
+                subject_data["status"]
+                == "Present"
+            ).sum()
+        )
+
+        absent = int(
+            (
+                subject_data["status"]
+                == "Absent"
+            ).sum()
+        )
+
+        holiday = int(
+            (
+                subject_data["status"]
+                == "Holiday"
+            ).sum()
+        )
+
+        not_conducted = int(
+            (
+                subject_data["status"]
+                == "Not Conducted"
+            ).sum()
+        )
+
+        total = present + absent
+
+        if total > 0:
+
+            percentage = (
+                present / total
+            ) * 100
+
         else:
-            df = pd.read_excel(upload)
-    except Exception as e:
-        return None, f"Could not read file: {e}"
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    def col(*names):
-        for n in names:
-            if n in df.columns:
-                return n
-        return None
-    day_col = col("day", "day name", "weekday")
-    subject_col = col("subject", "subject name", "class")
-    lecture_col = col("lecture", "lecture no", "lecture number", "period", "period no")
-    time_col = col("time", "lecture time", "timing")
-    code_col = col("subject code", "code", "subject_code")
-    if not day_col or not subject_col:
-        return None, "The file must contain 'Day' and 'Subject' columns."
-    rows = []
-    for i, r in df.iterrows():
-        day = str(r[day_col]).strip().title() if pd.notna(r[day_col]) else ""
-        subject = str(r[subject_col]).strip() if pd.notna(r[subject_col]) else ""
-        if not day or not subject:
-            continue
-        if day not in DAYS:
-            return None, f"Invalid day on row {i + 2}: {day}"
-        if lecture_col and pd.notna(r[lecture_col]):
-            try:
-                lecture_no = int(float(r[lecture_col]))
-            except ValueError:
-                lecture_no = len([x for x in rows if x["day_name"] == day]) + 1
-        else:
-            lecture_no = len([x for x in rows if x["day_name"] == day]) + 1
-        lecture_time = str(r[time_col]).strip() if time_col and pd.notna(r[time_col]) else f"Lecture {lecture_no}"
-        code = str(r[code_col]).strip() if code_col and pd.notna(r[code_col]) else subject[:12].upper()
-        rows.append({"day_name": day, "lecture_no": lecture_no, "lecture_time": lecture_time, "subject_code": code, "subject_name": subject})
-    return (rows, None) if rows else (None, "No timetable rows found.")
+
+            percentage = 0
+
+        report.append(
+            {
+                "Subject": subject,
+                "Present": present,
+                "Absent": absent,
+                "Holiday": holiday,
+                "Not Conducted": not_conducted,
+                "Total": total,
+                "Attendance %": round(
+                    percentage,
+                    1
+                )
+            }
+        )
+
+    return pd.DataFrame(report)
 
 
-# Initialize database before UI.
-get_connection().close()
+# ============================================================
+# 75% CALCULATOR
+# ============================================================
 
-for key, default in {"logged_in": False, "student_id": None, "student_name": "", "roll_number": "", "course": "", "division": "", "academic_year": ""}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+def classes_needed_for_75(
+    present,
+    total
+):
+
+    if total == 0:
+        return 0
+
+    if present / total >= 0.75:
+        return 0
+
+    needed = 0
+
+    while (
+        (present + needed)
+        / (total + needed)
+        < 0.75
+    ):
+
+        needed += 1
+
+    return needed
 
 
-# =====================================================
-# LOGIN
-# =====================================================
+# ============================================================
+# SESSION
+# ============================================================
+
+if "logged_in" not in st.session_state:
+
+    st.session_state.logged_in = False
+
+
+if "roll_number" not in st.session_state:
+
+    st.session_state.roll_number = ""
+
+
+# ============================================================
+# TITLE
+# ============================================================
+
+st.title("📚 Attendance Tracker")
+
+st.caption(
+    "Personal attendance tracker for any course, "
+    "class and timetable."
+)
+
+
+# ============================================================
+# LOGIN PAGE
+# ============================================================
 
 if not st.session_state.logged_in:
-    st.title("📚 Attendance Tracker")
-    st.caption("For any course • any division • any academic year")
-    login_tab, create_tab = st.tabs(["🔐 Login", "📝 Create Account"])
+
+    login_tab, account_tab = st.tabs(
+        [
+            "🔐 Login",
+            "📝 Create Account"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # LOGIN
+    # --------------------------------------------------------
+
     with login_tab:
-        roll = st.text_input("Roll Number")
-        password = st.text_input("Password", type="password")
-        if st.button("🔐 Login", type="primary", width="stretch"):
-            student = login_student(roll.strip(), password)
-            if student:
+
+        st.header("Login")
+
+        roll_number = st.text_input(
+            "Roll Number"
+        )
+
+        password = st.text_input(
+            "Password",
+            type="password"
+        )
+
+        if st.button(
+            "🔓 Login",
+            type="primary",
+            use_container_width=True
+        ):
+
+            student = get_student(
+                roll_number.strip()
+            )
+
+            if (
+                student
+                and
+                student["password_hash"]
+                == hash_password(password)
+            ):
+
                 st.session_state.logged_in = True
-                st.session_state.student_id = student["id"]
-                st.session_state.student_name = student["full_name"]
-                st.session_state.roll_number = student["roll_number"]
-                st.session_state.course = student["course"]
-                st.session_state.division = student["division"]
-                st.session_state.academic_year = student["academic_year"]
+
+                st.session_state.roll_number = (
+                    student["roll_number"]
+                )
+
                 st.rerun()
+
             else:
-                st.error("Invalid roll number or password.")
-    with create_tab:
-        name = st.text_input("Full Name")
-        roll_new = st.text_input("Roll Number", key="new_roll")
-        p1 = st.text_input("Create Password", type="password")
-        p2 = st.text_input("Confirm Password", type="password")
-        if st.button("📝 Create Account", type="primary", width="stretch"):
-            name, roll_new = name.strip(), roll_new.strip()
-            if not name or not roll_new or not p1:
-                st.error("Please fill all required fields.")
-            elif len(p1) < 6:
-                st.error("Password must be at least 6 characters.")
-            elif p1 != p2:
-                st.error("Passwords do not match.")
+
+                st.error(
+                    "Invalid roll number or password."
+                )
+
+    # --------------------------------------------------------
+    # CREATE ACCOUNT
+    # --------------------------------------------------------
+
+    with account_tab:
+
+        st.header("Create Account")
+
+        full_name = st.text_input(
+            "Full Name"
+        )
+
+        new_roll = st.text_input(
+            "Roll Number"
+        )
+
+        course = st.text_input(
+            "Course / Class",
+            placeholder="Example: B.Com"
+        )
+
+        section = st.text_input(
+            "Section / Division",
+            placeholder="Example: M-2"
+        )
+
+        new_password = st.text_input(
+            "Create Password",
+            type="password"
+        )
+
+        confirm_password = st.text_input(
+            "Confirm Password",
+            type="password"
+        )
+
+        if st.button(
+            "📝 Create Account",
+            type="primary",
+            use_container_width=True
+        ):
+
+            if not full_name.strip():
+
+                st.warning(
+                    "Enter your full name."
+                )
+
+            elif not new_roll.strip():
+
+                st.warning(
+                    "Enter your roll number."
+                )
+
+            elif not course.strip():
+
+                st.warning(
+                    "Enter your course."
+                )
+
+            elif not section.strip():
+
+                st.warning(
+                    "Enter your section."
+                )
+
+            elif not new_password:
+
+                st.warning(
+                    "Create a password."
+                )
+
+            elif new_password != confirm_password:
+
+                st.error(
+                    "Passwords do not match."
+                )
+
             else:
-                ok, msg = register_student(name, roll_new, p1)
-                (st.success if ok else st.error)(msg)
+
+                created = create_student(
+                    full_name,
+                    new_roll,
+                    new_password,
+                    course,
+                    section
+                )
+
+                if created:
+
+                    st.success(
+                        "Account created successfully. "
+                        "Now login."
+                    )
+
+                else:
+
+                    st.error(
+                        "This roll number already exists."
+                    )
+
     st.stop()
 
 
-# =====================================================
-# LOGGED-IN APP
-# =====================================================
+# ============================================================
+# LOGGED-IN STUDENT
+# ============================================================
 
-student_id = st.session_state.student_id
-student_name = st.session_state.student_name
-roll_number = st.session_state.roll_number
+student = get_student(
+    st.session_state.roll_number
+)
 
-st.title("📚 Attendance Tracker")
-parts = [x for x in [st.session_state.course, st.session_state.division, st.session_state.academic_year] if x]
-st.caption(" • ".join(parts) if parts else "Set up your class details below.")
+if student is None:
+
+    st.session_state.logged_in = False
+
+    st.rerun()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 with st.sidebar:
-    st.header("👤 My Account")
-    st.write(f"**Name:** {student_name}")
-    st.write(f"**Roll No.:** {roll_number}")
-    if st.session_state.course:
-        st.write(f"**Class:** {st.session_state.course}")
-    if st.session_state.division:
-        st.write(f"**Division:** {st.session_state.division}")
-    if st.session_state.academic_year:
-        st.write(f"**Year:** {st.session_state.academic_year}")
-    if st.button("🚪 Logout", width="stretch"):
-        for k in ["logged_in", "student_id", "student_name", "roll_number", "course", "division", "academic_year"]:
-            st.session_state[k] = False if k == "logged_in" else (None if k == "student_id" else "")
+
+    st.subheader("👤 My Account")
+
+    st.write(
+        f"**Name:** {student['full_name']}"
+    )
+
+    st.write(
+        f"**Roll:** {student['roll_number']}"
+    )
+
+    st.write(
+        f"**Course:** {student['course']}"
+    )
+
+    st.write(
+        f"**Section:** {student['section']}"
+    )
+
+    if st.button(
+        "🚪 Logout",
+        use_container_width=True
+    ):
+
+        st.session_state.logged_in = False
+
+        st.session_state.roll_number = ""
+
         st.rerun()
 
-setup_tab, attendance_tab, dashboard_tab, history_tab = st.tabs(["⚙️ Setup", "📝 Attendance", "📊 Dashboard", "📅 History"])
+
+# ============================================================
+# MAIN TABS
+# ============================================================
+
+today_tab, timetable_tab, report_tab, history_tab = st.tabs(
+    [
+        "📅 Today",
+        "🗓️ My Timetable",
+        "📊 Reports",
+        "📜 Past Dates"
+    ]
+)
 
 
-# =====================================================
-# SETUP
-# =====================================================
+# ============================================================
+# TODAY
+# ============================================================
 
-with setup_tab:
-    st.header("⚙️ Class & Timetable Setup")
-    st.info("Nothing is hard-coded to B.Com, M-2, 2026–27, or to any particular Wednesday/Thursday rule.")
-    with st.form("profile"):
-        course = st.text_input("Course / Class", value=st.session_state.course, placeholder="B.Com / BCA / BBA / Class 12")
-        division = st.text_input("Division / Section", value=st.session_state.division, placeholder="M-2 / A / B")
-        year = st.text_input("Academic Year", value=st.session_state.academic_year, placeholder="2026-27")
-        save_profile = st.form_submit_button("💾 Save Class Details", type="primary", width="stretch")
-    if save_profile:
-        update_profile(student_id, course.strip(), division.strip(), year.strip())
-        st.session_state.course = course.strip()
-        st.session_state.division = division.strip()
-        st.session_state.academic_year = year.strip()
-        st.success("Class details saved.")
-        st.rerun()
+with today_tab:
 
-    st.divider()
-    st.subheader("📤 Upload Timetable")
-    st.write("CSV or Excel columns: **Day, Lecture, Time, Subject Code, Subject**. You can have 3, 4, or any number of lectures per day.")
-    template = pd.DataFrame([
-        ["Monday", 1, "09:00-10:00", "FA", "Financial Accounting"],
-        ["Monday", 2, "10:00-11:00", "SPB", "Business"],
-        ["Tuesday", 1, "09:00-10:00", "BSC", "Statistics"],
-    ], columns=["Day", "Lecture", "Time", "Subject Code", "Subject"])
-    st.download_button("⬇️ Download Timetable Template", template.to_csv(index=False).encode(), "timetable_template.csv", "text/csv", width="stretch")
-    upload = st.file_uploader("Upload CSV or Excel timetable", type=["csv", "xlsx", "xls"])
-    if upload:
-        rows, error = read_timetable(upload)
-        if error:
-            st.error(error)
-        else:
-            preview = pd.DataFrame(rows).rename(columns={"day_name": "Day", "lecture_no": "Lecture", "lecture_time": "Time", "subject_code": "Subject Code", "subject_name": "Subject"})
-            st.dataframe(preview, width="stretch", hide_index=True)
-            if st.button("💾 Save Uploaded Timetable", type="primary", width="stretch"):
-                ok, msg = save_timetable(student_id, rows)
-                (st.success if ok else st.error)(msg)
-                if ok:
-                    st.rerun()
+    today = date.today()
 
-    st.divider()
-    st.subheader("✏️ Manual Timetable")
-    current = load_timetable(student_id)
-    manual = []
-    for day in DAYS:
-        with st.expander(day, expanded=(day == "Monday")):
-            old = current.get(day, [])
-            count = st.number_input(f"Lectures on {day}", 0, 12, len(old), 1, key=f"count_{day}")
-            for i in range(int(count)):
-                oldrow = old[i] if i < len(old) else ("", "", "")
-                c1, c2, c3 = st.columns([1.4, 1.2, 2.5])
-                with c1:
-                    t = st.text_input("Time", value=oldrow[1], key=f"time_{day}_{i}")
-                with c2:
-                    code = st.text_input("Code", value=oldrow[2], key=f"code_{day}_{i}")
-                with c3:
-                    subj = st.text_input("Subject", value=oldrow[3], key=f"subj_{day}_{i}")
-                if subj.strip():
-                    manual.append({"day_name": day, "lecture_no": i + 1, "lecture_time": t.strip() or f"Lecture {i + 1}", "subject_code": code.strip() or subj.strip()[:12].upper(), "subject_name": subj.strip()})
-    if st.button("💾 Save Manual Timetable", type="primary", width="stretch"):
-        ok, msg = save_timetable(student_id, manual)
-        (st.success if ok else st.error)(msg)
-        if ok:
+    st.header(
+        f"📅 {today.strftime('%A, %d %B %Y')}"
+    )
+
+    classes = get_classes_for_date(
+        student["roll_number"],
+        today
+    )
+
+    if not classes:
+
+        st.info(
+            "No lectures are scheduled for today."
+        )
+
+        st.write(
+            "Go to **My Timetable** and add today's subjects."
+        )
+
+    else:
+
+        st.subheader(
+            f"{len(classes)} lecture(s) today"
+        )
+
+        records = []
+
+        status_options = [
+            "Present",
+            "Absent",
+            "Holiday",
+            "Not Conducted"
+        ]
+
+        for item in sorted(
+            classes,
+            key=lambda x: x["lecture_number"]
+        ):
+
+            status = st.selectbox(
+                (
+                    f"Lecture "
+                    f"{item['lecture_number']} — "
+                    f"{item['subject']}"
+                ),
+                status_options,
+                key=f"today_{item['lecture_number']}"
+            )
+
+            records.append(
+                {
+                    "lecture_number":
+                        item["lecture_number"],
+                    "subject":
+                        item["subject"],
+                    "status":
+                        status
+                }
+            )
+
+        if st.button(
+            "💾 Save Today's Attendance",
+            type="primary",
+            use_container_width=True
+        ):
+
+            save_attendance(
+                student["roll_number"],
+                today,
+                records
+            )
+
+            st.success(
+                "Today's attendance saved."
+            )
+
             st.rerun()
 
-    current = load_timetable(student_id)
-    rows = []
-    for day in DAYS:
-        for no, tm, code, subj in current.get(day, []):
-            rows.append({"Day": day, "Lecture": no, "Time": tm, "Code": code, "Subject": subj})
-    if rows:
-        st.subheader("✅ Current Timetable")
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+# ============================================================
+# TIMETABLE
+# ============================================================
+
+with timetable_tab:
+
+    st.header("🗓️ My Weekly Timetable")
+
+    st.info(
+        "You can have a different number of lectures "
+        "on different days. There is no automatic "
+        "IKS-HDA Wednesday/Thursday rule."
+    )
+
+    existing = get_timetable(
+        student["roll_number"]
+    )
+
+    timetable_rows = []
+
+    day_names = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday"
+    ]
+
+    for weekday in range(6):
+
+        st.subheader(
+            day_names[weekday]
+        )
+
+        existing_day = [
+            x
+            for x in existing
+            if x["weekday"] == weekday
+        ]
+
+        existing_count = len(existing_day)
+
+        lecture_count = st.number_input(
+            f"Number of lectures on {day_names[weekday]}",
+            min_value=0,
+            max_value=10,
+            value=max(existing_count, 4),
+            step=1,
+            key=f"count_{weekday}"
+        )
+
+        for lecture_number in range(
+            1,
+            lecture_count + 1
+        ):
+
+            old_subject = ""
+
+            for old in existing_day:
+
+                if (
+                    old["lecture_number"]
+                    == lecture_number
+                ):
+
+                    old_subject = old["subject"]
+
+            subject = st.text_input(
+                f"Lecture {lecture_number}",
+                value=old_subject,
+                key=f"subject_{weekday}_{lecture_number}"
+            )
+
+            if subject.strip():
+
+                timetable_rows.append(
+                    {
+                        "weekday": weekday,
+                        "lecture_number":
+                            lecture_number,
+                        "subject": subject
+                    }
+                )
+
+    if st.button(
+        "💾 Save My Timetable",
+        type="primary",
+        use_container_width=True
+    ):
+
+        save_timetable(
+            student["roll_number"],
+            timetable_rows
+        )
+
+        st.success(
+            "Your timetable has been saved."
+        )
+
+        st.rerun()
 
 
-# =====================================================
-# ATTENDANCE
-# =====================================================
+# ============================================================
+# REPORT
+# ============================================================
 
-with attendance_tab:
-    st.header("📝 Mark Attendance")
-    current_date = today_india()
-    st.info(f"📅 Today's date: {current_date.strftime('%A, %d %B %Y')}")
-    selected = st.date_input("Select Date", value=current_date, max_value=current_date, help="Today and past dates are allowed. Future dates are blocked.")
-    if selected > current_date:
-        st.error("🚫 Future dates are not allowed.")
-        st.stop()
-    day = selected.strftime("%A")
-    st.subheader(f"📅 {day}, {selected.strftime('%d %B %Y')}")
-    st.success("🟢 Today's attendance." if selected == current_date else "📖 Past-date mode: view or update attendance.")
-    classes = load_timetable(student_id).get(day, [])
-    if not classes:
-        st.info(f"No classes are configured for {day}. Open Setup → Timetable.")
+with report_tab:
+
+    st.header("📊 Attendance Report")
+
+    attendance = get_attendance(
+        student["roll_number"]
+    )
+
+    if attendance.empty:
+
+        st.info(
+            "No attendance has been recorded yet."
+        )
+
     else:
-        holiday = st.checkbox("🟡 College Holiday — whole day", key=f"holiday_{selected}")
-        attendance = {}
-        for no, tm, code, subj in classes:
-            st.divider()
-            st.markdown(f"### Lecture {no} — {tm}")
-            st.write(f"**{code} — {subj}**")
-            key = f"{code} — {subj}"
-            if holiday:
-                attendance[key] = "Holiday"
-                st.warning("🟡 College Holiday — not counted.")
-            else:
-                attendance[key] = st.radio("Status", ["Present", "Absent", "Holiday"], horizontal=True, key=f"status_{selected}_{no}_{code}")
-        st.divider()
-        if st.button("💾 Save Attendance", type="primary", width="stretch"):
-            ok, msg = save_attendance(student_name, roll_number, selected, attendance)
-            (st.success if ok else st.error)(msg)
-            if ok:
-                st.rerun()
 
+        report = make_report(
+            attendance
+        )
 
-# =====================================================
-# DASHBOARD
-# =====================================================
+        total_present = int(
+            (
+                attendance["status"]
+                == "Present"
+            ).sum()
+        )
 
-with dashboard_tab:
-    st.header("📊 Attendance Dashboard")
-    data = load_attendance(student_name, roll_number)
-    if data.empty:
-        st.info("No attendance recorded yet.")
-    else:
-        conducted = data[data.status != "Holiday"]
-        present = len(data[data.status == "Present"])
-        absent = len(data[data.status == "Absent"])
-        total = len(conducted)
-        overall = (present / total * 100) if total else 0
-        a, b, c = st.columns(3)
-        a.metric("Overall", f"{overall:.1f}%")
-        b.metric("Present", present)
-        c.metric("Absent", absent)
-        st.divider()
-        timetable = load_timetable(student_id)
-        subjects = []
-        for day in DAYS:
-            for _, _, code, subj in timetable.get(day, []):
-                label = f"{code} — {subj}"
-                if label not in subjects:
-                    subjects.append(label)
-        for value in data.subject.dropna().unique():
-            if value not in subjects:
-                subjects.append(value)
-        report = []
-        for subject in subjects:
-            d = data[data.subject == subject]
-            p = len(d[d.status == "Present"])
-            ab = len(d[d.status == "Absent"])
-            h = len(d[d.status == "Holiday"])
-            t = p + ab
-            pct = p / t * 100 if t else 0
-            report.append({"Subject": subject, "Present": p, "Absent": ab, "Holiday": h, "Total": t, "Attendance %": round(pct, 1), "Need for 75%": needed_for_75(p, t), "Can Miss": can_miss_at_75(p, t)})
-        st.subheader("📚 Subject-wise Attendance")
-        st.dataframe(pd.DataFrame(report), width="stretch", hide_index=True)
-        st.subheader("🎯 75% Attendance Planner")
-        planner = []
-        for r in report:
-            if r["Total"] == 0:
-                text = "No classes recorded"
-            elif r["Attendance %"] < 75:
-                text = f"Attend next {r['Need for 75%']} class(es) continuously"
-            else:
-                text = f"You can miss {r['Can Miss']} class(es) and stay ≥ 75%"
-            planner.append({"Subject": r["Subject"], "Current %": r["Attendance %"], "Present": r["Presen
+        total_absent = int(
+            (
+                attendance["status"]
+                == "Absent"
+            ).sum()
+        )
+
+        total_classes = (
+            total_present
+            + total_absent
+        )
+
+        if total_classes > 0:
+
+            overall = round(
+                total_present
+                / total_classes
+                * 100,
+                1
+            )
+
+        else:
+
+            overall = 0
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Overall",
+            f"{overall}%"
+        )
+
+        col2.metric(
+            "Present",
+            total_present
+        )
+
+        col3.metric(
+            "Absent",
+            total_absent
+        )
+
+        st.subheader(
+            "📚 Subject-wise Attendance"
+        )
+
+        st.dataframe(
+            report,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ----------------------------------------------------
+        # 75%
+        # ----------------------------------------------------
+
+        st.subheader(
+            "⚠️ 75% A
