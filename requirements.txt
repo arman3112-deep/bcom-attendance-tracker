@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+xlrd
+pypdf
+python-docx
+Pillow
+pytesseract
+streamlit-cookies-controller
