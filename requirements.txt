@@ -1,6 +1,8 @@
 streamlit
 pandas
 openpyxl
+xlrd
 pypdf
 python-docx
-xlrd
+Pillow
+pytesseract
